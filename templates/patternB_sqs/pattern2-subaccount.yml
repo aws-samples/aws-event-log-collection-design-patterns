@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates an SQS Queue that subscribes to an AWS Account that sends S3 event notifications and sends it to an SNS Topic for consumption.
+
+Parameters:
+  pSnsTopicArn:
+    Type: String
+    Description: The ARN of the SNS Topic to which the SQS queue will subscribe.
+  pAWSAccountIDAllowedForKMSDecrypting:
+    Type: String
+    Description: The AWS Account ID of the source SNS Topic to which the SQS queue will subscribe to receive the encrypted messages.
+
+Resources:
+  rMyDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VisibilityTimeout: 60
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+      QueueName: DLQS3EventNotificationSubscriber
+  
+  rMyCustomKMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    Properties:
+      Description: "KMS key for encrypting SQS messages"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - "kms:*"
+            Resource: "*"
+          - Effect: "Allow"
+            Principal:
+              Service: "sns.amazonaws.com"
+            Action:
+              - "kms:GenerateDataKey"
+              - "kms:Decrypt"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref pAWSAccountIDAllowedForKMSDecrypting
+
+  rMyCustomKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/myCustomSQSKey
+      TargetKeyId: !Ref rMyCustomKMSKey
+
+  rMySQSQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: SQSS3EventNotificationSubscriber
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 345600
+      KmsMasterKeyId: !Ref rMyCustomKMSKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt rMyDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  rMySQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref rMySQSQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3EventNotifications
+            Effect: Allow
+            Principal:
+              Service: "sns.amazonaws.com"
+            Action: sqs:SendMessage
+            Resource: !GetAtt rMySQSQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Ref pSnsTopicArn
+              Bool: 
+                "aws:SecureTransport": "true"
+  rSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt rMySQSQueue.Arn
+      TopicArn: !Ref pSnsTopicArn
+
+  rMySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: MySNSTopic
+      DisplayName: SNS Topic for for publishing
+      KmsMasterKeyId: alias/aws/sns
+  rMySNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref rMySNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublishOverHttpsOnly
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref rMySNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceAccount: !Ref AWS::AccountId
+              Bool:
+                aws:SecureTransport: 'true'
+
+  rMyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: Access to CloudWatch Logs is granted to the Lambda execution role.
+          - id: W89
+            reason: This function do not communicate with VPC resources.
+          - id: W92
+            reason: Lambda does not need reserved concurrent executions.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Lambda does not need reserved concurrent executions.
+          - id: CKV_AWS_116
+            comment: DLQ not needed. This Lambda function is triggered only by CloudFormation events.
+          - id: CKV_AWS_117
+            comment: This function do not communicate with VPC resources.
+          - id: CKV_AWS_173
+            comment: Environment variables are not sensitive.
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt rMyLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              sns = boto3.client('sns')
+              topic_arn = f'{os.environ["SNS_TOPIC_ARN"]}'
+              
+              for record in event['Records']:
+                  try:
+                      record_body_data = json.loads(record['body'])
+                      message = record_body_data['Message']
+                      response = sns.publish(
+                          TopicArn=topic_arn,
+                          Message=message
+                      )
+                      logger.info(f"Message published to SNS topic {topic_arn}. Response: {response}")
+                  except Exception as e:
+                      logger.error(f"Failed to publish message to SNS topic {topic_arn}. Error: {str(e)}")
+      Runtime: python3.12
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref rMySNSTopic
+
+  rLambdaSQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt rMySQSQueue.Arn
+      FunctionName: !GetAtt rMyLambdaFunction.Arn
+      BatchSize: 10
+
+  rMyLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: "/"
+      RoleName: "rMyLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: LambdaSQSSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt rMySQSQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref rMySNSTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt rMyCustomKMSKey.Arn
+    
+  
+
+Outputs:
+  SQSQueueURL:
+    Description: "URL of the SQS Queue"
+    Value: !Ref rMySQSQueue
+  SQSQueueARN:
+    Description: "ARN of the SQS Queue"
+    Value: !GetAtt rMySQSQueue.Arn
+  DeadLetterQueueURL:
+    Description: "URL of the Dead Letter Queue for the SQS Queue"
+    Value: !Ref rMyDeadLetterQueue
+  DeadLetterQueueARN:
+    Description: "ARN of the Dead Letter Queue for the SQS Queue"
+    Value: !GetAtt rMyDeadLetterQueue.Arn
+  SNSTopicARN:
+    Description: "ARN of the SNS Topic"
+    Value: !Ref rMySNSTopic

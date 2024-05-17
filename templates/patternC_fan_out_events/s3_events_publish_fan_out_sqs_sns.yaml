@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This CloudFormation template to create S3 Event notification to SQS -> SNS for fan-out
+Parameters:
+  pS3BucketName:
+    Type: String
+    Description: S3 Bucket Name to enable event notification
+    Default: ''
+Resources:
+  rLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: Access to CloudWatch Logs is granted to the Lambda execution role.
+          - id: W89
+            reason: This function do not communicate with VPC resources.
+          - id: W92
+            reason: Lambda does not need reserved concurrent executions.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Lambda does not need reserved concurrent executions.
+          - id: CKV_AWS_116
+            comment: DLQ not needed. This Lambda function is triggered only by CloudFormation events.
+          - id: CKV_AWS_117
+            comment: This function do not communicate with VPC resources.
+          - id: CKV_AWS_173
+            comment: Environment variables are not sensitive.
+    Properties:
+      Description: !Sub Lambda function to enable s3 event notification to SQS for an existing S3 bucket ${pS3BucketName}
+      Runtime: python3.12
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          S3 = boto3.client('s3')
+          def create_event_notification(bucket_name, notif_type, notif_arn, events):
+              notif_type = notif_type.lower()
+              notif_key = {'sqs': ['QueueConfigurations', 'QueueArn', 'SQSQueue'],
+                           'sns': ['TopicConfigurations', 'TopicArn', 'SNSQueue']}
+              status = False
+              try:
+                  if notif_type in notif_key:
+                      notif_config={
+                      notif_key[notif_type][0] : [{
+                      'Id': notif_key[notif_type][2],
+                      notif_key[notif_type][1]: notif_arn,
+                      'Events': events
+                      }]
+                      }
+                      S3.put_bucket_notification_configuration(Bucket=bucket_name, NotificationConfiguration=notif_config)
+                      status = True
+                  else:
+                      logger.warn(f'Notification type {notif_type} not supported')
+              except ClientError as exe:
+                  logger.info(f'Exception: {exe}')
+              return status
+          def delete_event_notification(bucket_name):
+              try:
+                  S3.put_bucket_notification_configuration(
+                      Bucket=bucket_name,
+                      NotificationConfiguration={}
+                  )
+              except ClientError as exe:
+                  logger.info(f'Exception: {exe}')
+                  return False
+              return True
+          def lambda_handler(event, context):
+              logger.info(f'Event: {event}')
+              response_data = {}
+              bucket = event['ResourceProperties']['S3BucketName']
+              queue = event['ResourceProperties']['QueueArn']
+              events = ['s3:ObjectCreated:*']
+              logger.info(f'Bucket: {bucket}, Queue: {queue}')
+              cu_events = ['Create', 'Update']
+              del_events = ['Delete']
+              request_type = event['RequestType']
+              try:
+                  if request_type in cu_events:
+                      result = create_event_notification(bucket, 'sqs', queue, events)
+                      response_data = {'Status': 'SUCCESS', 'Output': result}
+                      logger.info(f'{request_type} completed: {response_data}')
+                  elif request_type in del_events:
+                      result = delete_event_notification(bucket)
+                      response_data = {'Status': 'SUCCESS', 'Output': result}
+                      logger.info(f'{request_type} completed: {response_data}')
+                  else:
+                      logger.info(f'Request type {request_type} not supported')
+              except Exception as exe:
+                  logger.info(f'Exception: {exe}')
+                  response_data = {'Status': 'FAILED', 'Output': str(exe)}
+              cfnresponse.send(event, context, response_data['Status'], response_data)
+  rLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: These permissions are required for lambda to create log group/stream(s)
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3-event-notification-lambda-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${pS3BucketName}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+  rS3BucketNotification:
+    Type: Custom::S3BucketNotification
+    Properties:
+      ServiceToken: !GetAtt rLambdaFunction.Arn
+      S3BucketName: !Ref pS3BucketName
+      QueueArn: !GetAtt rSQSQueue.Arn
+  rSQSDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 30
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  rSQSDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref rSQSDeadLetterQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt rSQSDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:s3:::${pS3BucketName}
+  rSQSQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt rSQSDeadLetterQueue.Arn
+        maxReceiveCount: 5
+  rSQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref rSQSQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt rSQSQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:s3:::${pS3BucketName}
+  rSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SNS Topic used as target for EventBus Pipe
+      KmsMasterKeyId: alias/aws/sns
+  rEventBusPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipe
+      RoleArn: !GetAtt rEventBusRole.Arn
+      Source: !GetAtt rSQSQueue.Arn
+      SourceParameters:
+        SqsQueueParameters:
+          BatchSize: 1
+      Target: !Ref rSNSTopic
+  rEventBusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-eventbus-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt rSQSQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                Resource:
+                  - !Ref rSNSTopic
+  rCrossAccountIAMRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: These permissions are required to list objects in the bucket.
+    Properties:
+      RoleName: !Sub s3-event-notification-cross-account-iam-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3-event-notification-cross-account-iam-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt rSQSQueue.Arn
+        - PolicyName: s3-permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${pS3BucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${pS3BucketName}/*
+Outputs:
+  oCrossAccountIAMRoleName:
+    Description: Cross Account IAM Role Name
+    Value: !Ref rCrossAccountIAMRole
+  oSNSTopicARN:
+    Description: SNS Topic ARN
+    Value: !GetAtt rSNSTopic.TopicArn
+  oSNSTopicName:
+    Description: SNS Queue Name
+    Value: !GetAtt rSNSTopic.TopicName

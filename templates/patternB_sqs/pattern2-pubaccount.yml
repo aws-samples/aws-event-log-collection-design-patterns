@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for creating an S3 Event Notification for new objects that are created in a specified S3 bucket and send through SNS messages to an SQS Queue subscriber that you specify.
+Parameters:
+  pBucketName:
+    Type: String
+    Description: The name of your centralized S3 bucket to configure for S3 event notifications whenever new objects are added.
+  pAllowedAWSAccountId:
+    Type: String
+    Description: The AWS Account ID for the SQS queue subscriber which SNS will send the S3 event notification messages.
+    AllowedPattern: (^$|^[0-9]{12}$)
+Conditions:
+  cAllowedAWSAccountId: !Not
+    - !Equals
+      - !Ref pAllowedAWSAccountId
+      - ''
+Resources:
+  rS3EventNotificationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: Access to CloudWatch Logs is granted to the Lambda execution role.
+          - id: W89
+            reason: This function do not communicate with VPC resources.
+          - id: W92
+            reason: Lambda does not need reserved concurrent executions.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Lambda does not need reserved concurrent executions.
+          - id: CKV_AWS_116
+            comment: DLQ not needed. This Lambda function is triggered only by CloudFormation events.
+          - id: CKV_AWS_117
+            comment: This function do not communicate with VPC resources.
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          S3 = boto3.client('s3')
+          def create_event_notification(bucket_name, notif_type, notif_arn, events):
+              notif_type = notif_type.lower()
+              notif_key = {'sqs': ['QueueConfigurations', 'QueueArn', 'SQSQueue'],
+                           'sns': ['TopicConfigurations', 'TopicArn', 'SNSQueue']}
+              status = False
+              try:
+                  if notif_type in notif_key:
+                      notif_config={
+                      notif_key[notif_type][0] : [{
+                      'Id': notif_key[notif_type][2],
+                      notif_key[notif_type][1]: notif_arn,
+                      'Events': events
+                      }]
+                      }
+                      S3.put_bucket_notification_configuration(Bucket=bucket_name, NotificationConfiguration=notif_config)
+                      status = True
+                  else:
+                      logger.warn(f'Notification type {notif_type} not supported')
+              except ClientError as exe:
+                  logger.info(f'Exception: {exe}')
+              return status
+          def delete_event_notification(bucket_name):
+              try:
+                  S3.put_bucket_notification_configuration(
+                      Bucket=bucket_name,
+                      NotificationConfiguration={}
+                  )
+              except ClientError as exe:
+                  logger.info(f'Exception: {exe}')
+                  return False
+              return True
+          def lambda_handler(event, context):
+              logger.info(f'Event: {event}')
+              response_data = {}
+              bucket = event['ResourceProperties']['BucketName']
+              topic = event['ResourceProperties']['TopicArn']
+              events = ['s3:ObjectCreated:*']
+              logger.info(f'Bucket: {bucket}, Topic: {topic}')
+              cu_events = ['Create', 'Update']
+              del_events = ['Delete']
+              request_type = event['RequestType']
+              try:
+                  if request_type in cu_events:
+                      result = create_event_notification(bucket, 'sns', topic, events)
+                      response_data = {'Status': 'SUCCESS', 'Output': result}
+                      logger.info(f'{request_type} completed: {response_data}')
+                  elif request_type in del_events:
+                      result = delete_event_notification(bucket)
+                      response_data = {'Status': 'SUCCESS', 'Output': result}
+                      logger.info(f'{request_type} completed: {response_data}')
+                  else:
+                      logger.info(f'Request type {request_type} not supported')
+              except Exception as exe:
+                  logger.info(f'Exception: {exe}')
+                  response_data = {'Status': 'FAILED', 'Output': str(exe)}
+              cfnresponse.send(event, context, response_data['Status'], response_data)
+  rLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: These permissions are required for lambda to create log group/stream(s)
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3ExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub arn:${AWS::Partition}:s3:::${pBucketName}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+  rSNSTopicS3EventNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SNS Topic for new objects created in S3 Bucket
+      KmsMasterKeyId: alias/aws/sns
+  rSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref rSNSTopicS3EventNotification
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublishToSQS
+            Effect: Allow
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref rSNSTopicS3EventNotification
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:s3:::${pBucketName}
+          - Sid: AllowSQSSubscription
+            Effect: Allow
+            Principal:
+              AWS: !If
+                - cAllowedAWSAccountId
+                - !Ref pAllowedAWSAccountId
+                - !Ref AWS::AccountId
+            Action: sns:Subscribe
+            Resource: !Ref rSNSTopicS3EventNotification
+  rS3NotificationCustomResource:
+    Type: Custom::S3NotificationConfiguration
+    Properties:
+      ServiceToken: !GetAtt rS3EventNotificationLambdaFunction.Arn
+      BucketName: !Ref pBucketName
+      TopicArn: !Ref rSNSTopicS3EventNotification
+  rCrossAccountIAMRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: These permissions are required to list objects in the bucket.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - cAllowedAWSAccountId
+                - !Ref pAllowedAWSAccountId
+                - !Ref AWS::AccountId
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3-permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${pBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${pBucketName}/*
+Outputs:
+  oSNSTopicARN:
+    Description: ARN of the SNS topic that will receive the S3 event notifications
+    Value: !Ref rSNSTopicS3EventNotification
+  oCrossAccountIAMRoleName:
+    Description: Cross Account IAM Role Name
+    Value: !Ref rCrossAccountIAMRole
+  oCrossAccountIAMRoleArn:
+    Description: Cross Account IAM Role Arn
+    Value: !GetAtt rCrossAccountIAMRole.Arn
